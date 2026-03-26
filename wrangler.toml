@@ -1,0 +1,24 @@
+name = "echo-inventory"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["0 7 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-inventory"
+database_id = "a010cdfc-1326-453b-9b48-9b81483a23bc"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "c63f69ec55cd4b9da0d4b8504caece56"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
