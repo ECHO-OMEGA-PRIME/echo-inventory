@@ -80,6 +80,20 @@ app.use('*', async (c, next) => {
 const tid = (c: { req: { header: (n: string) => string | undefined; query: (n: string) => string | undefined } }) =>
   c.req.header('X-Tenant-ID') || c.req.query('tenant_id') || 'default';
 
+// ─── Auth middleware ────────────────────────────────────────────────
+app.use('*', async (c, next) => {
+  const method = c.req.method;
+  const path = new URL(c.req.url).pathname;
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/' || path.startsWith('/public/')) return next();
+  const apiKey = c.req.header('X-Echo-API-Key') || '';
+  const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
+  const expected = c.env.ECHO_API_KEY;
+  if (!expected || (apiKey !== expected && bearer !== expected)) {
+    return c.json({ error: 'Unauthorized', message: 'Valid X-Echo-API-Key or Bearer token required for write operations' }, 401);
+  }
+  return next();
+});
+
 // ─── Health ─────────────────────────────────────────────────────────
 app.get('/health', async (c) => {
   try { await c.env.DB.prepare('SELECT 1').first(); return c.json({ ok: true, service: 'echo-inventory', version: '1.0.0', d1: 'connected', ts: new Date().toISOString() }); }
