@@ -541,6 +541,18 @@ async function cronHandler(env: Env) {
   log('info', 'Cron complete', { alerts: alertCount, low_stock: lowStock.results?.length || 0, out_of_stock: oos.results?.length || 0 });
 }
 
+app.onError((err, c) => {
+  if (err.message?.includes('JSON')) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  console.error(`[echo-inventory] ${err.message}`);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
+app.notFound((c) => {
+  return c.json({ error: 'Not found' }, 404);
+});
+
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
