@@ -228,19 +228,16 @@ app.post('/stock/adjust', async (c) => {
   const type = (b.type as string) || 'adjustment';
   const lot = (b.lot_number as string) || null;
 
-  // Upsert stock level
-  const existing = await c.env.DB.prepare('SELECT * FROM stock_levels WHERE product_id = ? AND warehouse_id = ? AND (lot_number IS ? OR lot_number = ?)').bind(productId, warehouseId, lot, lot).first();
-  if (existing) {
-    const newQty = (existing.on_hand as number) + qty;
-    await c.env.DB.prepare("UPDATE stock_levels SET on_hand = ?, updated_at = datetime('now') WHERE id = ?").bind(Math.max(0, newQty), existing.id).run();
-  } else {
-    await c.env.DB.prepare('INSERT INTO stock_levels (id, tenant_id, product_id, warehouse_id, on_hand, lot_number) VALUES (?,?,?,?,?,?)').bind(id(), t, productId, warehouseId, Math.max(0, qty), lot).run();
-  }
-
-  // Record movement
-  await c.env.DB.prepare('INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id, lot_number, notes, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)').bind(
-    id(), t, productId, warehouseId, type, qty, b.reference_type || null, b.reference_id || null, lot, b.notes || null, b.created_by || 'api'
-  ).run();
+  // Atomic upsert stock level + record movement in single batch
+  const movementId = id();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "INSERT INTO stock_levels (id, tenant_id, product_id, warehouse_id, on_hand, lot_number) VALUES (?,?,?,?,MAX(0,?),?) ON CONFLICT(product_id, warehouse_id) DO UPDATE SET on_hand = MAX(0, on_hand + ?), updated_at = datetime('now')"
+    ).bind(id(), t, productId, warehouseId, qty, lot, qty),
+    c.env.DB.prepare(
+      'INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id, lot_number, notes, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+    ).bind(movementId, t, productId, warehouseId, type, qty, b.reference_type || null, b.reference_id || null, lot, b.notes || null, b.created_by || 'api'),
+  ]);
 
   log('info', 'Stock adjusted', { product_id: productId, warehouse_id: warehouseId, qty, type });
   return c.json({ adjusted: true, quantity: qty, type });
@@ -316,29 +313,41 @@ app.post('/purchase-orders/:id/send', async (c) => {
 app.post('/purchase-orders/:id/receive', async (c) => {
   const t = tid(c);
   const b = await c.req.json() as { items: Array<{ po_item_id: string; received_qty: number }> };
-  const po = await c.env.DB.prepare('SELECT * FROM purchase_orders WHERE id = ? AND tenant_id = ?').bind(c.req.param('id'), t).first();
-  if (!po) return c.json({ error: 'Not found' }, 404);
+  const po = await c.env.DB.prepare("SELECT * FROM purchase_orders WHERE id = ? AND tenant_id = ? AND status IN ('sent','partial')").bind(c.req.param('id'), t).first();
+  if (!po) return c.json({ error: 'Not found or already fully received' }, 404);
 
+  // Collect all items and build batch statements
+  const stmts: ReturnType<D1Database['prepare']>[] = [];
   for (const recv of b.items) {
     const item = await c.env.DB.prepare('SELECT * FROM po_items WHERE id = ? AND po_id = ?').bind(recv.po_item_id, po.id).first();
     if (!item) continue;
-    await c.env.DB.prepare('UPDATE po_items SET received_qty = received_qty + ? WHERE id = ?').bind(recv.received_qty, recv.po_item_id).run();
 
-    // Adjust stock
-    const existing = await c.env.DB.prepare('SELECT * FROM stock_levels WHERE product_id = ? AND warehouse_id = ?').bind(item.product_id, po.warehouse_id).first();
-    if (existing) {
-      await c.env.DB.prepare("UPDATE stock_levels SET on_hand = on_hand + ?, incoming = MAX(0, incoming - ?), updated_at = datetime('now') WHERE id = ?").bind(recv.received_qty, recv.received_qty, existing.id).run();
-    } else {
-      await c.env.DB.prepare('INSERT INTO stock_levels (id, tenant_id, product_id, warehouse_id, on_hand) VALUES (?,?,?,?,?)').bind(id(), t, item.product_id, po.warehouse_id, recv.received_qty).run();
-    }
+    // Update received qty on PO item
+    stmts.push(c.env.DB.prepare('UPDATE po_items SET received_qty = received_qty + ? WHERE id = ?').bind(recv.received_qty, recv.po_item_id));
 
-    await c.env.DB.prepare('INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id) VALUES (?,?,?,?,?,?,?,?)').bind(id(), t, item.product_id as string, po.warehouse_id as string, 'receive', recv.received_qty, 'purchase_order', po.id).run();
+    // Atomic stock upsert — no TOCTOU
+    stmts.push(c.env.DB.prepare(
+      "INSERT INTO stock_levels (id, tenant_id, product_id, warehouse_id, on_hand) VALUES (?,?,?,?,?) ON CONFLICT(product_id, warehouse_id) DO UPDATE SET on_hand = on_hand + ?, incoming = MAX(0, incoming - ?), updated_at = datetime('now')"
+    ).bind(id(), t, item.product_id, po.warehouse_id, recv.received_qty, recv.received_qty, recv.received_qty));
+
+    // Record movement
+    stmts.push(c.env.DB.prepare(
+      'INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id) VALUES (?,?,?,?,?,?,?,?)'
+    ).bind(id(), t, item.product_id as string, po.warehouse_id as string, 'receive', recv.received_qty, 'purchase_order', po.id));
   }
 
-  // Check if fully received
+  if (stmts.length === 0) return c.json({ error: 'No valid items to receive' }, 400);
+
+  // Execute all stock changes atomically
+  await c.env.DB.batch(stmts);
+
+  // Check if fully received and update PO status with guard
   const remaining = await c.env.DB.prepare('SELECT SUM(quantity - received_qty) as rem FROM po_items WHERE po_id = ?').bind(po.id).first();
   const newStatus = ((remaining as Record<string, unknown>)?.rem as number || 0) <= 0 ? 'received' : 'partial';
-  await c.env.DB.prepare("UPDATE purchase_orders SET status = ?, received_date = CASE WHEN ? = 'received' THEN datetime('now') ELSE received_date END, updated_at = datetime('now') WHERE id = ?").bind(newStatus, newStatus, po.id).run();
+  const poUpdate = await c.env.DB.prepare("UPDATE purchase_orders SET status = ?, received_date = CASE WHEN ? = 'received' THEN datetime('now') ELSE received_date END, updated_at = datetime('now') WHERE id = ? AND status IN ('sent','partial')").bind(newStatus, newStatus, po.id).run();
+  if (!poUpdate.meta.changes) {
+    log('warn', 'PO status update had no effect — concurrent receive may have completed it', { po_id: po.id as string });
+  }
 
   return c.json({ received: true, status: newStatus });
 });
@@ -369,26 +378,41 @@ app.post('/transfers', async (c) => {
 
 app.post('/transfers/:id/complete', async (c) => {
   const t = tid(c);
-  const transfer = await c.env.DB.prepare('SELECT * FROM transfers WHERE id = ? AND tenant_id = ?').bind(c.req.param('id'), t).first();
-  if (!transfer) return c.json({ error: 'Not found' }, 404);
+  const transfer = await c.env.DB.prepare("SELECT * FROM transfers WHERE id = ? AND tenant_id = ? AND status = 'pending'").bind(c.req.param('id'), t).first();
+  if (!transfer) return c.json({ error: 'Not found or already completed' }, 404);
+
+  // Claim the transfer atomically — status guard prevents double-complete
+  const claim = await c.env.DB.prepare("UPDATE transfers SET status = 'in_transit', updated_at = datetime('now') WHERE id = ? AND status = 'pending'").bind(transfer.id).run();
+  if (!claim.meta.changes) return c.json({ error: 'Transfer already being processed' }, 409);
+
   const items = await c.env.DB.prepare('SELECT * FROM transfer_items WHERE transfer_id = ?').bind(transfer.id).all();
 
+  // Build all statements for atomic batch execution
+  const stmts: ReturnType<D1Database['prepare']>[] = [];
   for (const item of (items.results || []) as Array<Record<string, unknown>>) {
     // Decrease from source
-    await c.env.DB.prepare("UPDATE stock_levels SET on_hand = MAX(0, on_hand - ?), updated_at = datetime('now') WHERE product_id = ? AND warehouse_id = ?").bind(item.quantity, item.product_id, transfer.from_warehouse_id).run();
-    // Increase at destination
-    const existing = await c.env.DB.prepare('SELECT id FROM stock_levels WHERE product_id = ? AND warehouse_id = ?').bind(item.product_id, transfer.to_warehouse_id).first();
-    if (existing) {
-      await c.env.DB.prepare("UPDATE stock_levels SET on_hand = on_hand + ?, updated_at = datetime('now') WHERE id = ?").bind(item.quantity, existing.id).run();
-    } else {
-      await c.env.DB.prepare('INSERT INTO stock_levels (id, tenant_id, product_id, warehouse_id, on_hand) VALUES (?,?,?,?,?)').bind(id(), t, item.product_id, transfer.to_warehouse_id, item.quantity).run();
-    }
+    stmts.push(c.env.DB.prepare(
+      "UPDATE stock_levels SET on_hand = MAX(0, on_hand - ?), updated_at = datetime('now') WHERE product_id = ? AND warehouse_id = ?"
+    ).bind(item.quantity, item.product_id, transfer.from_warehouse_id));
+
+    // Increase at destination — atomic upsert, no TOCTOU
+    stmts.push(c.env.DB.prepare(
+      "INSERT INTO stock_levels (id, tenant_id, product_id, warehouse_id, on_hand) VALUES (?,?,?,?,?) ON CONFLICT(product_id, warehouse_id) DO UPDATE SET on_hand = on_hand + ?, updated_at = datetime('now')"
+    ).bind(id(), t, item.product_id, transfer.to_warehouse_id, item.quantity, item.quantity));
+
     // Record movements
-    await c.env.DB.prepare('INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id) VALUES (?,?,?,?,?,?,?,?)').bind(id(), t, item.product_id as string, transfer.from_warehouse_id as string, 'transfer_out', -(item.quantity as number), 'transfer', transfer.id).run();
-    await c.env.DB.prepare('INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id) VALUES (?,?,?,?,?,?,?,?)').bind(id(), t, item.product_id as string, transfer.to_warehouse_id as string, 'transfer_in', item.quantity, 'transfer', transfer.id).run();
+    stmts.push(c.env.DB.prepare(
+      'INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id) VALUES (?,?,?,?,?,?,?,?)'
+    ).bind(id(), t, item.product_id as string, transfer.from_warehouse_id as string, 'transfer_out', -(item.quantity as number), 'transfer', transfer.id));
+    stmts.push(c.env.DB.prepare(
+      'INSERT INTO stock_movements (id, tenant_id, product_id, warehouse_id, movement_type, quantity, reference_type, reference_id) VALUES (?,?,?,?,?,?,?,?)'
+    ).bind(id(), t, item.product_id as string, transfer.to_warehouse_id as string, 'transfer_in', item.quantity, 'transfer', transfer.id));
   }
 
-  await c.env.DB.prepare("UPDATE transfers SET status = 'completed', completed_at = datetime('now') WHERE id = ?").bind(transfer.id).run();
+  // Mark transfer completed — include in the atomic batch
+  stmts.push(c.env.DB.prepare("UPDATE transfers SET status = 'completed', completed_at = datetime('now') WHERE id = ?").bind(transfer.id));
+
+  await c.env.DB.batch(stmts);
   return c.json({ completed: true });
 });
 
