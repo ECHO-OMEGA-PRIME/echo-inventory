@@ -106,7 +106,7 @@ app.use('*', async (c, next) => {
 });
 
 // ─── Health ─────────────────────────────────────────────────────────
-app.get('/', (c) => c.redirect('/health'));
+app.get('/', (c) => c.json({ service: 'echo-inventory', version: '1.0.0', status: 'operational' }));
 app.get('/health', async (c) => {
   try { await c.env.DB.prepare('SELECT 1').first(); return c.json({ ok: true, service: 'echo-inventory', version: '1.0.0', d1: 'connected', ts: new Date().toISOString() }); }
   catch { return c.json({ ok: false, service: 'echo-inventory', d1: 'error' }, 500); }
