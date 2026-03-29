@@ -161,7 +161,7 @@ app.options('*', (c) => c.body(null, 204));
 // Rate limit middleware
 app.use('*', async (c, next) => {
   const p = new URL(c.req.url).pathname;
-  if (p === '/health' || p === '/') return next();
+  if (p === '/health' || p === '/' || p === '/plans' || p === '/webhooks/stripe') return next();
   const ip = c.req.header('CF-Connecting-IP') || 'x';
   const w = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(c.req.method);
   const { ok: allowed, rem } = await rl(c.env.CACHE, `inv:${ip}:${w ? 'w' : 'r'}`, w ? 60 : 200, 60);
@@ -177,7 +177,7 @@ const tid = (c: { req: { header: (n: string) => string | undefined; query: (n: s
 app.use('*', async (c, next) => {
   const method = c.req.method;
   const path = new URL(c.req.url).pathname;
-  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/' || path.startsWith('/public/')) return next();
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/' || path.startsWith('/public/') || path === '/webhooks/stripe') return next();
   const apiKey = c.req.header('X-Echo-API-Key') || '';
   const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
   const expected = c.env.ECHO_API_KEY;
@@ -188,9 +188,9 @@ app.use('*', async (c, next) => {
 });
 
 // ─── Health ─────────────────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'echo-inventory', version: '1.0.0', status: 'operational' }));
+app.get('/', (c) => c.json({ service: 'echo-inventory', version: '2.0.0', status: 'operational' }));
 app.get('/health', async (c) => {
-  try { await c.env.DB.prepare('SELECT 1').first(); return c.json({ ok: true, service: 'echo-inventory', version: '1.0.0', d1: 'connected', ts: new Date().toISOString() }); }
+  try { await c.env.DB.prepare('SELECT 1').first(); return c.json({ ok: true, service: 'echo-inventory', version: '2.0.0', d1: 'connected', stripe: !!c.env.STRIPE_SECRET_KEY, ts: new Date().toISOString() }); }
   catch { return c.json({ ok: false, service: 'echo-inventory', d1: 'error' }, 500); }
 });
 
@@ -657,6 +657,87 @@ async function cronHandler(env: Env) {
 
   log('info', 'Cron complete', { alerts: alertCount, low_stock: lowStock.results?.length || 0, out_of_stock: oos.results?.length || 0 });
 }
+
+// ═══ STRIPE PAYMENTS ════════════════════════════════════════════════
+app.get('/plans', (c) => c.json({ ok: true, plans: INVENTORY_PLANS, service: 'echo-inventory' }));
+
+app.post('/webhooks/stripe', async (c) => {
+  const body = await c.req.text();
+  const sig = c.req.header('Stripe-Signature') || '';
+  const secret = c.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) return c.json({ error: 'Webhook secret not configured' }, 500);
+  const valid = await verifyStripeSignature(body, sig, secret);
+  if (!valid) { log('warn', 'Stripe webhook signature invalid'); return c.json({ error: 'Invalid signature' }, 401); }
+  try {
+    const event = JSON.parse(body) as { type: string; data: { object: Record<string, unknown> } };
+    log('info', 'Stripe webhook received', { type: event.type });
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const tenantId = (session.metadata as Record<string, string>)?.tenant_id;
+      const planId = (session.metadata as Record<string, string>)?.plan_id;
+      if (tenantId && planId) {
+        await c.env.DB.prepare("UPDATE tenants SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(planId, session.customer || null, session.subscription || null, tenantId).run();
+        log('info', 'Tenant upgraded via Stripe', { tenantId, planId });
+      }
+    } else if (event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      const customerId = sub.customer as string;
+      if (customerId) {
+        await c.env.DB.prepare("UPDATE tenants SET plan = 'free', stripe_subscription_id = NULL, updated_at = datetime('now') WHERE stripe_customer_id = ?")
+          .bind(customerId).run();
+        log('info', 'Tenant downgraded to free', { customerId });
+      }
+    }
+    return c.json({ ok: true, received: true });
+  } catch (e: unknown) {
+    log('error', 'Stripe webhook processing failed', { error: String(e) });
+    return c.json({ error: 'Webhook processing error' }, 500);
+  }
+});
+
+app.post('/plans/upgrade', async (c) => {
+  const b = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+  if (!b?.tenant_id || !b?.plan_id) return c.json({ error: 'Missing tenant_id or plan_id' }, 400);
+  const plan = INVENTORY_PLANS.find(p => p.id === b.plan_id);
+  if (!plan) return c.json({ error: 'Invalid plan_id' }, 400);
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 500);
+  try {
+    const resp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        'mode': 'subscription',
+        'success_url': 'https://echo-ept.com/dashboard?upgrade=success',
+        'cancel_url': 'https://echo-ept.com/dashboard?upgrade=cancel',
+        'line_items[0][price_data][currency]': 'usd',
+        'line_items[0][price_data][unit_amount]': String(Math.round(plan.price * 100)),
+        'line_items[0][price_data][recurring][interval]': 'month',
+        'line_items[0][price_data][product_data][name]': `Echo Inventory - ${plan.name}`,
+        'metadata[tenant_id]': String(b.tenant_id),
+        'metadata[plan_id]': plan.id,
+      }).toString(),
+    });
+    const session = await resp.json() as Record<string, unknown>;
+    if (!resp.ok) { log('error', 'Stripe checkout failed', { error: session }); return c.json({ error: 'Stripe checkout creation failed' }, 500); }
+    return c.json({ ok: true, checkout_url: session.url, session_id: session.id });
+  } catch (e: unknown) {
+    log('error', 'Stripe API error', { error: String(e) });
+    return c.json({ error: 'Payment service unavailable' }, 503);
+  }
+});
+
+app.post('/admin/migrate-stripe', async (c) => {
+  try {
+    await c.env.DB.prepare("ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT").run().catch(() => {});
+    log('info', 'Stripe migration complete');
+    return c.json({ ok: true, migrated: true });
+  } catch (e: unknown) {
+    log('error', 'Stripe migration failed', { error: String(e) });
+    return c.json({ error: 'Migration failed' }, 500);
+  }
+});
 
 app.onError((err, c) => {
   if (err.message?.includes('JSON')) {
