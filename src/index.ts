@@ -1,9 +1,10 @@
 /**
- * Echo Inventory v1.0.0 — AI-Powered Inventory Management
- * =========================================================
+ * Echo Inventory v2.0.0 — AI-Powered Inventory Management + Stripe Payments
+ * ===========================================================================
  * Multi-warehouse stock tracking, purchase orders, transfers,
  * stocktaking, AI demand forecasting, low-stock alerts, barcode/SKU,
  * lot tracking, inventory valuation, supplier management.
+ * Stripe subscription billing: Free / Starter $19.99 / Pro $49.99 / Enterprise $149.99
  */
 
 import { Hono } from 'hono';
@@ -14,6 +15,87 @@ interface Env {
   ENGINE_RUNTIME: Fetcher;
   SHARED_BRAIN: Fetcher;
   ECHO_API_KEY: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+}
+
+// ─── Stripe Plans ───────────────────────────────────────────────────
+interface InventoryPlan {
+  id: string;
+  name: string;
+  price: number;
+  interval: 'month';
+  features: string[];
+  limits: { products: number; warehouses: number; users: number };
+}
+
+const INVENTORY_PLANS: InventoryPlan[] = [
+  {
+    id: 'free', name: 'Free', price: 0, interval: 'month',
+    features: ['Up to 50 products', '1 warehouse', 'Basic stock tracking', 'Manual alerts'],
+    limits: { products: 50, warehouses: 1, users: 1 },
+  },
+  {
+    id: 'starter', name: 'Starter', price: 19.99, interval: 'month',
+    features: ['Up to 500 products', '3 warehouses', 'Purchase orders', 'Low-stock alerts', 'Barcode/SKU', 'Basic analytics'],
+    limits: { products: 500, warehouses: 3, users: 3 },
+  },
+  {
+    id: 'pro', name: 'Pro', price: 49.99, interval: 'month',
+    features: ['Up to 5,000 products', '10 warehouses', 'AI demand forecasting', 'Transfers & stocktakes', 'Supplier management', 'Full analytics', 'Lot tracking', 'API access'],
+    limits: { products: 5000, warehouses: 10, users: 10 },
+  },
+  {
+    id: 'enterprise', name: 'Enterprise', price: 149.99, interval: 'month',
+    features: ['Unlimited products', 'Unlimited warehouses', 'Everything in Pro', 'Priority support', 'Custom integrations', 'Dedicated account manager', 'SLA guarantee', 'Bulk import/export'],
+    limits: { products: -1, warehouses: -1, users: -1 },
+  },
+];
+
+// ─── Stripe Signature Verification (Web Crypto API) ─────────────────
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  try {
+    const parts = sigHeader.split(',').reduce((acc, part) => {
+      const [key, val] = part.split('=');
+      if (key === 't') acc.timestamp = val;
+      if (key === 'v1') acc.signatures.push(val);
+      return acc;
+    }, { timestamp: '', signatures: [] as string[] });
+
+    if (!parts.timestamp || parts.signatures.length === 0) return false;
+
+    // Reject if timestamp is older than 5 minutes
+    const age = Math.floor(Date.now() / 1000) - parseInt(parts.timestamp);
+    if (age > 300) return false;
+
+    const signedPayload = `${parts.timestamp}.${payload}`;
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+    const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    return parts.signatures.some(s => s === expected);
+  } catch {
+    return false;
+  }
+}
+
+// ─── Stripe API helper ──────────────────────────────────────────────
+async function stripeAPI(env: Env, endpoint: string, method = 'GET', body?: Record<string, string>): Promise<Record<string, unknown>> {
+  const opts: RequestInit = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  };
+  if (body) {
+    opts.body = new URLSearchParams(body).toString();
+  }
+  const resp = await fetch(`https://api.stripe.com/v1/${endpoint}`, opts);
+  return resp.json() as Promise<Record<string, unknown>>;
 }
 
 const app = new Hono<{ Bindings: Env }>();
